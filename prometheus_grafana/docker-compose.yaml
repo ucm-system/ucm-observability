@@ -1,0 +1,25 @@
+# docker-compose.yaml
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus_server
+    ports:
+      - "9090:9090"   # the default port used by Prometheus
+    volumes:
+      - ${PWD}/prometheus.yml:/etc/prometheus/prometheus.yml # mount Prometheus config file
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana_server
+
+    ports:
+      - "3000:3000" # the default port used by Grafana
+    volumes:
+      - ${PWD}/grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml
+      - ${PWD}/grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/provider.yml
+      - ${PWD}/dashboards:/var/lib/grafana/dashboards
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
