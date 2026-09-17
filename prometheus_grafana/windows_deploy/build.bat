@@ -50,7 +50,7 @@ echo DLL flags: !DLL_FLAGS!
 REM 4. Build from project root
 cd /d "%PROJ_ROOT%"
 
-python -m PyInstaller --noconfirm --onefile --windowed --name UCMObsDeploy --add-data "prometheus_grafana/prometheus.yml;." --add-data "prometheus_grafana/docker-compose.yaml;." --add-data "prometheus_grafana/grafana-datasource.yml;." --add-data "prometheus_grafana/grafana-dashboard-provider.yml;." --add-data "prometheus_grafana/dashboards;dashboards" !DLL_FLAGS! "prometheus_grafana/windows_deploy/deploy_client.pyw"
+python -m PyInstaller --noconfirm --onefile --windowed --name UCMObsDeploy --add-data "prometheus_grafana/prometheus.yml;." --add-data "prometheus_grafana/docker-compose.yaml;." --add-data "prometheus_grafana/grafana-datasource.yml;." --add-data "prometheus_grafana/grafana-dashboard-provider.yml;." --add-data "prometheus_grafana/src/deploy_client_core.py;." --add-data "prometheus_grafana/dashboards;dashboards" !DLL_FLAGS! "prometheus_grafana/windows_deploy/deploy_client.pyw"
 
 if errorlevel 1 (
     echo [ERROR] Build failed.

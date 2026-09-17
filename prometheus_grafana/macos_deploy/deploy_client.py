@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-UCM Observability 部署工具 (跨平台客户端)
-
-通过 SSH 将 Prometheus + Grafana 部署到远程服务器。
-Windows 使用 .pyw 后缀可无控制台窗口运行。
-"""
 import importlib.util
 import os
 import sys
