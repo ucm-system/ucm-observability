@@ -16,8 +16,9 @@ import threading
 import subprocess
 import tempfile
 import traceback
+import webbrowser
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 
 try:
     import yaml
@@ -55,6 +56,12 @@ DASHBOARDS_DIR = os.path.join(RESOURCE_DIR, "dashboards")
 
 GRAFANA_PORT = 3000
 PROMETHEUS_PORT = 9090
+
+# 镜像包下载地址 (离线环境可先下载镜像包, 再通过本工具上传导入)
+IMAGE_DOWNLOAD_URLS = {
+    "prometheus": "https://modelscope.cn/datasets/keriko/UCM_tools/tree/master/metrics/Prometheus",
+    "grafana": "https://modelscope.cn/datasets/keriko/UCM_tools/tree/master/metrics/Grafana",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +126,18 @@ class RemoteHost:
         finally:
             sftp.close()
 
+    def upload_file(self, local_path, remote_path, log=None):
+        sftp = self.client.open_sftp()
+        try:
+            rdir = remote_path.rsplit("/", 1)[0]
+            if rdir:
+                self._sftp_mkdir_p(sftp, rdir)
+            sftp.put(local_path, remote_path)
+            if log:
+                log(f"上传 {os.path.basename(local_path)} -> {remote_path}")
+        finally:
+            sftp.close()
+
     @staticmethod
     def _sftp_mkdir_p(sftp, path):
         parts = path.strip("/").split("/")
@@ -138,12 +157,13 @@ class RemoteHost:
 class DeployApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("UCM Observability \u90e8\u7f72\u5de5\u5177  (Prometheus + Grafana)")
-        self.geometry("940x760")
-        self.minsize(820, 640)
+        self.title("UCM Observability 部署工具  (Prometheus + Grafana)")
+        self.geometry("940x820")
+        self.minsize(860, 660)
 
         self.remote = RemoteHost()
         self.deploying = False
+        self.deployments = {}
 
         self._build_ui()
         self._load_images_from_compose()
@@ -188,7 +208,7 @@ class DeployApp(tk.Tk):
         self.btn_disconnect.pack(side="left", padx=(6, 0))
 
         # Container images & ports
-        frm2 = ttk.LabelFrame(main, text="\u5bb9\u5668\u955c\u50cf\u4e0e\u7aef\u53e3 (\u53ef\u4fee\u6539)", padding=8)
+        frm2 = ttk.LabelFrame(main, text="容器镜像与端口", padding=8)
         frm2.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         frm2.columnconfigure(1, weight=1)
 
@@ -196,14 +216,25 @@ class DeployApp(tk.Tk):
         self.var_img_graf = tk.StringVar()
         self.var_port_prom = tk.StringVar(value=str(PROMETHEUS_PORT))
         self.var_port_graf = tk.StringVar(value=str(GRAFANA_PORT))
-        ttk.Label(frm2, text="Prometheus \u955c\u50cf:").grid(row=0, column=0, sticky="w")
+        ttk.Label(frm2, text="Prometheus 镜像:").grid(row=0, column=0, sticky="w")
         ttk.Entry(frm2, textvariable=self.var_img_prom).grid(row=0, column=1, sticky="ew", **pad)
-        ttk.Label(frm2, text="\u7aef\u53e3:").grid(row=0, column=2, sticky="e")
+        ttk.Label(frm2, text="端口:").grid(row=0, column=2, sticky="e")
         ttk.Entry(frm2, textvariable=self.var_port_prom, width=7).grid(row=0, column=3, sticky="w", **pad)
-        ttk.Label(frm2, text="Grafana \u955c\u50cf:").grid(row=1, column=0, sticky="w")
+        ttk.Button(frm2, text="下载地址",
+                   command=lambda: self._open_url(IMAGE_DOWNLOAD_URLS["prometheus"])
+                   ).grid(row=0, column=4, sticky="w")
+        ttk.Label(frm2, text="Grafana 镜像:").grid(row=1, column=0, sticky="w")
         ttk.Entry(frm2, textvariable=self.var_img_graf).grid(row=1, column=1, sticky="ew", **pad)
-        ttk.Label(frm2, text="\u7aef\u53e3:").grid(row=1, column=2, sticky="e")
+        ttk.Label(frm2, text="端口:").grid(row=1, column=2, sticky="e")
         ttk.Entry(frm2, textvariable=self.var_port_graf, width=7).grid(row=1, column=3, sticky="w", **pad)
+        ttk.Button(frm2, text="下载地址",
+                   command=lambda: self._open_url(IMAGE_DOWNLOAD_URLS["grafana"])
+                   ).grid(row=1, column=4, sticky="w")
+        ttk.Label(
+            frm2,
+            text="镜像名称自动读取自 docker-compose.yaml，一般无需修改；仅当服务器上镜像名称不同或需指定版本时才修改。",
+            foreground="#777",
+        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
 
         # vLLM targets
         frm3 = ttk.LabelFrame(main, text="vLLM \u670d\u52a1\u5730\u5740 (\u6bcf\u884c\u4e00\u4e2a, \u683c\u5f0f host:port)", padding=8)
@@ -218,9 +249,32 @@ class DeployApp(tk.Tk):
         self.txt_targets.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
 
+        # Existing deployments on the server
+        frm_dep = ttk.LabelFrame(main, text="服务器上已部署的面板服务 (连接后自动探测)", padding=8)
+        frm_dep.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        frm_dep.columnconfigure(0, weight=1)
+
+        cols = ("container", "status", "port", "url")
+        self.tree_dep = ttk.Treeview(frm_dep, columns=cols, show="headings", height=3, selectmode="browse")
+        self.tree_dep.heading("container", text="容器")
+        self.tree_dep.heading("status", text="状态")
+        self.tree_dep.heading("port", text="端口")
+        self.tree_dep.heading("url", text="访问地址")
+        self.tree_dep.column("container", width=150, anchor="w")
+        self.tree_dep.column("status", width=120, anchor="w")
+        self.tree_dep.column("port", width=60, anchor="center")
+        self.tree_dep.column("url", width=230, anchor="w")
+        self.tree_dep.grid(row=0, column=0, sticky="ew")
+
+        dep_btn = ttk.Frame(frm_dep)
+        dep_btn.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(dep_btn, text="重新探测", command=self.on_detect_deployments).pack(side="left")
+        ttk.Button(dep_btn, text="打开页面", command=self.on_open_selected_deployment).pack(side="left", padx=(6, 0))
+        ttk.Button(dep_btn, text="卸载选中", command=self.on_uninstall_selected_deployment).pack(side="left", padx=(6, 0))
+
         # Action buttons
         frm4 = ttk.Frame(main)
-        frm4.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        frm4.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         self.btn_deploy = ttk.Button(frm4, text="\u5f00\u59cb\u90e8\u7f72", command=self.on_deploy)
         self.btn_deploy.pack(side="left")
         self.btn_uninstall = ttk.Button(frm4, text="\u5378\u8f7d", command=self.on_uninstall)
@@ -228,8 +282,8 @@ class DeployApp(tk.Tk):
         ttk.Button(frm4, text="\u6e05\u7a7a\u65e5\u5fd7", command=self.on_clear_log).pack(side="left", padx=(6, 0))
 
         # Log area
-        frm5 = ttk.LabelFrame(main, text="\u65e5\u5fd7", padding=4)
-        frm5.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
+        frm5 = ttk.LabelFrame(main, text="日志", padding=4)
+        frm5.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
         frm5.columnconfigure(0, weight=1)
         frm5.rowconfigure(0, weight=1)
 
@@ -243,7 +297,7 @@ class DeployApp(tk.Tk):
         st = ttk.Label(self, textvariable=self.var_status, relief="sunken", anchor="w")
         st.pack(fill="x", side="bottom")
 
-        main.rowconfigure(4, weight=1)
+        main.rowconfigure(5, weight=1)
 
     def _load_images_from_compose(self):
         try:
@@ -284,6 +338,23 @@ class DeployApp(tk.Tk):
                     except ValueError:
                         pass
         return None
+
+    def _open_url(self, url):
+        try:
+            webbrowser.open(url)
+            self.log(f"已打开: {url}", "info")
+        except Exception as e:
+            self.log(f"无法打开浏览器: {e}", "error")
+
+    @staticmethod
+    def _normalize_image(image):
+        image = (image or "").strip()
+        if not image:
+            return image
+        tail = image.rsplit("/", 1)[-1]
+        if ":" not in tail:
+            image += ":latest"
+        return image
 
     # ---- Log / status helpers (thread-safe) -------------------------------
 
@@ -472,6 +543,52 @@ class DeployApp(tk.Tk):
         evt.wait()
         return result["value"]
 
+    def ask_openfile(self, title, prompt, filetypes):
+        evt = threading.Event()
+        result = {"value": None}
+
+        def _show():
+            dlg = tk.Toplevel(self)
+            dlg.title(title)
+            dlg.transient(self)
+            dlg.grab_set()
+            frm = ttk.Frame(dlg, padding=16)
+            frm.pack(fill="both", expand=True)
+            ttk.Label(frm, text=prompt, wraplength=460, justify="left").pack(anchor="w")
+            var = tk.StringVar()
+
+            def on_pick():
+                path = filedialog.askopenfilename(title=title, parent=dlg, filetypes=filetypes)
+                if path:
+                    var.set(path)
+
+            row = ttk.Frame(frm)
+            row.pack(fill="x", pady=8)
+            ent = ttk.Entry(row, textvariable=var, width=52)
+            ent.pack(side="left", fill="x", expand=True)
+            ttk.Button(row, text="浏览...", command=on_pick).pack(side="left", padx=(6, 0))
+
+            def on_ok():
+                result["value"] = var.get().strip() or None
+                evt.set()
+                dlg.destroy()
+
+            def on_cancel():
+                result["value"] = None
+                evt.set()
+                dlg.destroy()
+
+            bf = ttk.Frame(frm)
+            bf.pack(fill="x", pady=(4, 0))
+            ttk.Button(bf, text="确定", command=on_ok).pack(side="left")
+            ttk.Button(bf, text="取消", command=on_cancel).pack(side="right")
+            dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+            dlg.geometry(f"+{self.winfo_rootx() + 120}+{self.winfo_rooty() + 160}")
+
+        self.after(0, _show)
+        evt.wait()
+        return result["value"]
+
     # ---- UI action handlers -----------------------------------------------
 
     def on_test_connect(self):
@@ -484,27 +601,159 @@ class DeployApp(tk.Tk):
     def _test_worker(self):
         try:
             self._connect_from_ui()
-            self.log("SSH \u8fde\u63a5\u6210\u529f", "ok")
+            self.log("SSH 连接成功", "ok")
             code, out = self.remote.run("docker --version")
             if code == 0 and out.strip():
                 ver = out.strip().splitlines()[0]
-                self.log(f"\u8fdc\u7a0b docker: {ver}")
+                self.log(f"远程 docker: {ver}")
+                if self._ensure_compose_cmd():
+                    self.log(f"compose 命令: {self.remote.compose_cmd}")
+                else:
+                    self.log("未检测到 docker compose，部署/卸载功能不可用", "warn")
+                self._detect_and_refresh()
             else:
-                self.log("\u8fdc\u7a0b\u672a\u68c0\u6d4b\u5230 docker", "warn")
-            self.set_status(f"\u5df2\u8fde\u63a5 {self.var_user.get()}@{self.var_host.get()}")
+                self.log("远程未检测到 docker", "warn")
+            self.set_status(f"已连接 {self.var_user.get()}@{self.var_host.get()}")
         except Exception as e:
-            self.log(f"\u8fde\u63a5\u5931\u8d25: {e}", "error")
-            self.set_status("\u8fde\u63a5\u5931\u8d25")
+            self.log(f"连接失败: {e}", "error")
+            self.set_status("连接失败")
 
     def on_disconnect(self):
         self.remote.close()
-        self.var_status.set("\u5df2\u65ad\u5f00")
-        self.log("\u5df2\u65ad\u5f00\u8fde\u63a5", "info")
+        self.var_status.set("已断开")
+        self.log("已断开连接", "info")
+        self._refresh_dep_tree([])
 
     def on_clear_log(self):
         self.txt_log.config(state="normal")
         self.txt_log.delete("1.0", "end")
         self.txt_log.config(state="disabled")
+
+    # ---- Existing deployments detection / management ----------------------
+
+    def on_detect_deployments(self):
+        if self.deploying:
+            return
+        if not self.remote.is_connected():
+            self.log("未连接服务器，无法探测已部署服务", "warn")
+            return
+        threading.Thread(target=self._detect_and_refresh, daemon=True).start()
+
+    def _detect_and_refresh(self):
+        try:
+            deps = self._detect_existing_deployments()
+            self.after(0, self._refresh_dep_tree, deps)
+            if deps:
+                self.log(f"探测到 {len(deps)} 个已部署的面板服务，可在列表中选择打开或卸载", "ok")
+            else:
+                self.log("未探测到已部署的面板服务", "info")
+        except Exception as e:
+            self.log(f"探测已部署服务失败: {e}", "warn")
+
+    def _detect_existing_deployments(self):
+        fmt = '{{.Names}}|{{.Status}}|{{.Ports}}|{{.Label "com.docker.compose.project.working_dir"}}'
+        cmd = "docker ps -a --format " + shlex.quote(fmt)
+        code, out = self.remote.run(cmd, timeout=60)
+        if code != 0:
+            self.log("docker ps 执行失败，无法探测已部署服务", "warn")
+            return []
+        host = self.var_host.get().strip()
+        deps = []
+        for line in out.splitlines():
+            parts = line.split("|")
+            if len(parts) < 4:
+                continue
+            name, status, ports, workdir = (p.strip() for p in parts[:4])
+            if "grafana" not in name.lower():
+                continue
+            if workdir in ("<no value>", "<nil>"):
+                workdir = ""
+            port = None
+            m = re.search(r":(\d+)->", ports)
+            if m:
+                port = m.group(1)
+            deps.append({
+                "name": name,
+                "status": status,
+                "port": port or "-",
+                "url": f"http://{host}:{port}" if port else "",
+                "workdir": workdir,
+            })
+        return deps
+
+    def _refresh_dep_tree(self, deployments):
+        self.deployments = {}
+        self.tree_dep.delete(*self.tree_dep.get_children())
+        for d in deployments:
+            iid = self.tree_dep.insert("", "end", values=(d["name"], d["status"], d["port"], d["url"] or "-"))
+            self.deployments[iid] = d
+
+    def on_open_selected_deployment(self):
+        sel = self.tree_dep.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表中选择一个服务")
+            return
+        d = self.deployments.get(sel[0])
+        if not d:
+            return
+        if not d["url"]:
+            messagebox.showwarning("无法打开", "该容器未发布端口或已停止，无法生成访问地址")
+            return
+        self._open_url(d["url"])
+
+    def on_uninstall_selected_deployment(self):
+        if self.deploying:
+            return
+        sel = self.tree_dep.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表中选择一个服务")
+            return
+        d = self.deployments.get(sel[0])
+        if not d:
+            return
+        target = d["workdir"] or d["name"]
+        if not messagebox.askyesno(
+            "确认卸载",
+            f"将停止并移除: {target}\n(compose 部署会移除整个项目，含关联的 Prometheus 容器)\n\n是否继续？",
+        ):
+            return
+        self.deploying = True
+        self.btn_deploy.config(state="disabled")
+        self.btn_uninstall.config(state="disabled")
+        threading.Thread(target=self._uninstall_selected_worker, args=(d,), daemon=True).start()
+
+    def _uninstall_selected_worker(self, d):
+        try:
+            if d.get("workdir"):
+                qdir = shlex.quote(d["workdir"])
+                code, out = self.remote.run(f"cd {qdir} && {self.remote.compose_cmd} down", timeout=300)
+                if out.strip():
+                    self.log(out.strip())
+                if code == 0:
+                    self.log(f"已卸载 compose 项目: {d['workdir']}", "ok")
+                else:
+                    self.log("docker compose down 失败，改为直接移除容器 ...", "warn")
+                    code, out = self.remote.run(f"docker rm -f {shlex.quote(d['name'])}", timeout=120)
+                    if out.strip():
+                        self.log(out.strip())
+                    if code != 0:
+                        raise RuntimeError(f"移除容器 {d['name']} 失败")
+                    self.log(f"已移除容器 {d['name']}", "ok")
+            else:
+                code, out = self.remote.run(f"docker rm -f {shlex.quote(d['name'])}", timeout=120)
+                if out.strip():
+                    self.log(out.strip())
+                if code != 0:
+                    raise RuntimeError(f"移除容器 {d['name']} 失败")
+                self.log(f"已移除容器 {d['name']}", "ok")
+            self.notify("卸载完成", f"{d['name']} 已停止并移除")
+        except Exception as e:
+            self.log(f"卸载失败: {e}", "error")
+            self.notify("卸载失败", str(e))
+        finally:
+            self.deploying = False
+            self.after(0, lambda: (self.btn_deploy.config(state="normal"), self.btn_uninstall.config(state="normal")))
+            self._detect_and_refresh()
 
     def on_deploy(self):
         if self.deploying:
@@ -551,6 +800,7 @@ class DeployApp(tk.Tk):
         finally:
             self.deploying = False
             self.after(0, lambda: (self.btn_deploy.config(state="normal"), self.btn_uninstall.config(state="normal")))
+            self._detect_and_refresh()
 
     def _run_uninstall(self):
         self.log("==== \u5f00\u59cb\u5378\u8f7d ====")
@@ -618,16 +868,9 @@ class DeployApp(tk.Tk):
         self.log(f"docker: {out.strip().splitlines()[-1]}")
 
         # 3. Check compose
-        code, out = self.remote.run("docker compose version")
-        if code == 0:
-            self.remote.compose_cmd = "docker compose"
-            self.log("docker compose (v2) \u5df2\u5b89\u88c5")
-        else:
-            code, out = self.remote.run("docker-compose --version")
-            if code != 0:
-                raise RuntimeError("\u8fdc\u7a0b\u670d\u52a1\u5668\u672a\u5b89\u88c5 docker compose")
-            self.remote.compose_cmd = "docker-compose"
-            self.log("docker-compose (v1) \u5df2\u5b89\u88c5")
+        if not self._ensure_compose_cmd():
+            raise RuntimeError("远程服务器未安装 docker compose")
+        self.log(f"{self.remote.compose_cmd} 已安装")
 
         # 4. Check images
         image_map = self._collect_images()
@@ -635,52 +878,66 @@ class DeployApp(tk.Tk):
         for svc, image in image_map.items():
             if not image:
                 continue
-            q = shlex.quote(image)
+            q = shlex.quote(self._normalize_image(image))
             cmd = f"docker images --filter reference={q} --format '{{{{.Repository}}}}:{{{{.Tag}}}}'"
             code, out = self.remote.run(cmd)
             if code == 0 and out.strip():
-                self.log(f"\u955c\u50cf\u5b58\u5728: {image}  (\u670d\u52a1: {svc})", "ok")
+                self.log(f"镜像存在: {image}  (服务: {svc})", "ok")
             else:
-                self.log(f"\u955c\u50cf\u4e0d\u5b58\u5728: {image}  (\u670d\u52a1: {svc})", "warn")
+                self.log(f"镜像不存在: {image}  (服务: {svc})", "warn")
                 missing.append((svc, image))
         if missing:
-            self.log("\u5c1d\u8bd5\u5728\u670d\u52a1\u5668\u4e0a\u641c\u7d22\u76f8\u8fd1\u955c\u50cf ...", "info")
+            self.log("部分镜像不存在，尝试在服务器上搜索相近镜像 ...", "info")
         for svc, image in missing:
             keyword = "prometheus" if "prom" in svc.lower() else svc.lower()
             cmd2 = f"docker images --format '{{{{.Repository}}}}:{{{{.Tag}}}}' | grep -i {shlex.quote(keyword)}"
             code2, out2 = self.remote.run(cmd2)
             candidates = [l.strip() for l in out2.splitlines() if l.strip()]
             if candidates:
-                self.log(f"\u641c\u7d22\u5230\u76f8\u8fd1\u955c\u50cf: {', '.join(candidates)}", "info")
+                self.log(f"搜索到相近镜像: {', '.join(candidates)}", "info")
                 choice = self.ask_choice(
-                    "\u9009\u62e9\u955c\u50cf",
-                    f"\u670d\u52a1 [{svc}] \u7684\u955c\u50cf '{image}' \u4e0d\u5b58\u5728\uff0c\u4f46\u670d\u52a1\u5668\u4e0a\u627e\u5230\u4ee5\u4e0b\u76f8\u8fd1\u955c\u50cf\uff1a\n\n\u8bf7\u9009\u62e9\u8981\u4f7f\u7528\u7684\u955c\u50cf\uff1a",
+                    "选择镜像",
+                    f"服务 [{svc}] 的镜像 '{image}' 不存在，但服务器上找到以下相近镜像：\n\n请选择要使用的镜像：",
                     candidates,
                 )
                 if choice:
                     image_map[svc] = choice
-                    self.var_img_prom.set(choice) if "prom" in svc.lower() else self.var_img_graf.set(choice)
-                    self.log(f"\u670d\u52a1 [{svc}] \u4f7f\u7528\u955c\u50cf: {choice}", "ok")
+                    if "prom" in svc.lower():
+                        self.var_img_prom.set(choice)
+                    else:
+                        self.var_img_graf.set(choice)
+                    self.log(f"服务 [{svc}] 使用镜像: {choice}", "ok")
                     continue
-            self.log(
-                f"\u955c\u50cf\u4e0b\u8f7d\u5730\u5740\u63d0\u793a: "
-                f"https://modelscope.cn/datasets/keriko/UCM_tools/tree/master/metrics/Grafana , "
-                f"https://modelscope.cn/datasets/keriko/UCM_tools/tree/master/metrics/Prometheus",
-                "info",
+            opt_pull = "尝试 docker pull (服务器需可连外网)"
+            opt_tar = "上传本地镜像包 (.tar) 并导入"
+            opt_cancel = "取消部署"
+            action = self.ask_choice(
+                "镜像不存在",
+                f"服务 [{svc}] 需要的镜像 '{image}' 在服务器上不存在。\n\n"
+                f"镜像包下载地址:\n"
+                f"  - Grafana: {IMAGE_DOWNLOAD_URLS['grafana']}\n"
+                f"  - Prometheus: {IMAGE_DOWNLOAD_URLS['prometheus']}\n\n"
+                f"若服务器无法连外网 (docker pull 会失败)，请选择 '{opt_tar}'，\n"
+                f"程序将通过 SFTP 上传镜像包并执行 docker load 导入。",
+                [opt_pull, opt_tar, opt_cancel],
             )
-            new = self.ask_text(
-                "\u955c\u50cf\u4e0d\u5b58\u5728",
-                f"\u670d\u52a1 [{svc}] \u9700\u8981\u7684\u955c\u50cf '{image}' \u5728\u670d\u52a1\u5668\u4e0a\u4e0d\u5b58\u5728\u3002\n"
-                f"\u53ef\u4ece\u4ee5\u4e0b\u5730\u5740\u4e0b\u8f7d\u5e76\u5bfc\u5165\u955c\u50cf:\n"
-                f"  - https://modelscope.cn/datasets/keriko/UCM_tools/tree/master/metrics/Grafana\n"
-                f"  - https://modelscope.cn/datasets/keriko/UCM_tools/tree/master/metrics/Prometheus\n\n"
-                f"\u8bf7\u8f93\u5165\u5b9e\u9645\u5b58\u5728\u7684\u955c\u50cf\u540d\u79f0 (\u7559\u7a7a\u5219\u5c1d\u8bd5 docker pull):",
-                initial=image,
-            )
-            if new:
-                image_map[svc] = new.strip()
+            if action == opt_pull:
+                new = self.ask_text(
+                    "镜像名称",
+                    f"要拉取的镜像名称 (留空使用 {image}):",
+                    initial=image,
+                )
+                if new and new.strip():
+                    image_map[svc] = new.strip()
+                    if "prom" in svc.lower():
+                        self.var_img_prom.set(new.strip())
+                    else:
+                        self.var_img_graf.set(new.strip())
+            elif action == opt_tar:
+                if not self._load_image_from_tar(svc, self._normalize_image(image)):
+                    raise RuntimeError(f"服务 [{svc}] 镜像导入失败，部署中止")
             else:
-                image_map[svc] = image
+                raise RuntimeError("用户取消部署")
 
         # 5. Parse vLLM targets
         targets = self._parse_targets()
@@ -729,12 +986,15 @@ class DeployApp(tk.Tk):
             url = f"http://{host}:{grafana_port}"
             self.log("", "ok")
             self.log("==============================================", "ok")
-            self.log("\u90e8\u7f72\u6210\u529f!", "ok")
-            self.log(f"Grafana \u8bbf\u95ee\u5730\u5740: {url}", "ok")
-            self.log("\u9ed8\u8ba4\u8d26\u53f7\u5bc6\u7801: admin / admin", "info")
+            self.log("部署成功!", "ok")
+            self.log(f"Grafana 访问地址: {url}", "ok")
+            self.log("默认账号密码: admin / admin", "info")
             self.log(f"Prometheus: http://{host}:{prometheus_port}", "ok")
             self.log("==============================================", "ok")
-            self.notify("\u90e8\u7f72\u6210\u529f", f"Grafana: {url}\n\u8d26\u53f7\u5bc6\u7801: admin / admin")
+            self.log("正在打开 Grafana 页面 ...", "info")
+            self.after(0, self._open_url, url)
+            self.notify("部署成功", f"Grafana: {url}\n账号密码: admin / admin")
+            self._detect_and_refresh()
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
@@ -750,6 +1010,83 @@ class DeployApp(tk.Tk):
         if "grafana" in svcs:
             m["grafana"] = self.var_img_graf.get().strip()
         return m
+
+    def _ensure_compose_cmd(self):
+        code, _ = self.remote.run("docker compose version", timeout=30)
+        if code == 0:
+            self.remote.compose_cmd = "docker compose"
+            return True
+        code, _ = self.remote.run("docker-compose --version", timeout=30)
+        if code == 0:
+            self.remote.compose_cmd = "docker-compose"
+            return True
+        return False
+
+    def _load_image_from_tar(self, svc, required_image):
+        tar_path = self.ask_openfile(
+            "选择镜像包",
+            f"请选择服务 [{svc}] 需要的镜像包文件 (.tar / .tar.gz):\n"
+            f"可从以下地址下载:\n  - {IMAGE_DOWNLOAD_URLS.get(svc, IMAGE_DOWNLOAD_URLS['grafana'])}",
+            [("镜像包 (*.tar;*.tar.gz;*.tgz)", "*.tar;*.tar.gz;*.tgz"), ("所有文件 (*.*)", "*.*")],
+        )
+        if not tar_path:
+            self.log("未选择镜像包", "warn")
+            return False
+
+        _, before = self.remote.run("docker images --format '{{.Repository}}:{{.Tag}}'")
+        before_set = {l.strip() for l in before.splitlines() if l.strip()}
+
+        code, out = self.remote.run("echo $HOME")
+        home_dir = out.strip()
+        fname = os.path.basename(tar_path).replace('"', "").replace("'", "")
+        remote_path = f"{home_dir}/ucm-observability/images/{fname}"
+        size_mb = os.path.getsize(tar_path) / (1024 * 1024)
+        self.log(f"上传镜像包 {fname} ({size_mb:.1f} MB) 到服务器，文件较大时请耐心等待 ...", "info")
+        self.remote.upload_file(tar_path, remote_path, log=self.log)
+        self.log("镜像包上传完成", "ok")
+
+        qpath = shlex.quote(remote_path)
+        if remote_path.endswith((".tar.gz", ".tgz")):
+            load_cmd = f"gunzip -c {qpath} | docker load"
+        else:
+            load_cmd = f"docker load -i {qpath}"
+        self.log(f"执行: {load_cmd}")
+        code, out = self.remote.run(load_cmd, timeout=3600)
+        if out.strip():
+            self.log(out.strip())
+        if code != 0:
+            self.log("docker load 执行失败", "error")
+            return False
+
+        _, after = self.remote.run("docker images --format '{{.Repository}}:{{.Tag}}'")
+        after_set = {l.strip() for l in after.splitlines() if l.strip()}
+        if required_image in after_set:
+            self.log(f"镜像导入成功: {required_image}", "ok")
+            return True
+
+        new_images = sorted(after_set - before_set)
+        target = None
+        if len(new_images) == 1:
+            target = new_images[0]
+            self.log(f"导入的镜像为 {target}", "info")
+        elif new_images:
+            self.log(f"镜像包导入了多个镜像: {', '.join(new_images)}", "info")
+            target = self.ask_choice(
+                "选择镜像",
+                f"镜像包导入了多个镜像，请选择用于服务 [{svc}] 的镜像\n(将被标记为 {required_image}):",
+                new_images,
+            )
+        if target:
+            code, out = self.remote.run(
+                f"docker tag {shlex.quote(target)} {shlex.quote(required_image)}", timeout=60
+            )
+            if code == 0:
+                self.log(f"已将 {target} 标记为 {required_image}", "ok")
+                return True
+            self.log(f"docker tag 失败: {out.strip()}", "error")
+            return False
+        self.log(f"导入后未发现所需镜像 {required_image}", "error")
+        return False
 
     def _parse_targets(self):
         raw = self.txt_targets.get("1.0", "end").strip()
