@@ -281,7 +281,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "editorMode": "code",
-          "expr": "max_over_time(sum(vllm:num_requests_running{model_name=~\"$model_name\", job=~\"$job\", instance=~\"$instance\"})[$__range])",
+          "expr": "max_over_time(sum(vllm:num_requests_running{model_name=~\"$model_name\", job=~\"$job\", instance=~\"$instance\"})[$__range:$__interval])",
           "legendFormat": "",
           "range": true,
           "refId": "A"
@@ -323,7 +323,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "editorMode": "code",
-          "expr": "avg_over_time(sum(vllm:num_requests_running{model_name=~\"$model_name\", job=~\"$job\", instance=~\"$instance\"})[$__range])",
+          "expr": "avg_over_time(sum(vllm:num_requests_running{model_name=~\"$model_name\", job=~\"$job\", instance=~\"$instance\"})[$__range:$__interval])",
           "legendFormat": "",
           "range": true,
           "refId": "A"
