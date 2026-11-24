@@ -1236,7 +1236,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         {
-          "expr": "max_over_time(sum(vllm:num_requests_running{model_name=~\"$model_name\", job=~\"$job\", instance=~\"$instance\"})[$__range])",
+          "expr": "max_over_time(sum(vllm:num_requests_running{model_name=~\"$model_name\", job=~\"$job\", instance=~\"$instance\"})[$__range:$__interval])",
           "legendFormat": "Peak Concurrency",
           "refId": "A",
           "instant": true,
